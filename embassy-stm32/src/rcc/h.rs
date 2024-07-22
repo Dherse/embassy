@@ -213,6 +213,10 @@ pub struct Config {
 
     /// Per-peripheral kernel clock selection muxes
     pub mux: super::mux::ClockMux,
+
+    /// Whether to assume that the clocks have already been setup
+    /// e.g for the case where the clocks are setup in the bootloader.
+    pub assume_init: bool,
 }
 
 impl Default for Config {
@@ -251,6 +255,7 @@ impl Default for Config {
             supply_config: SupplyConfig::LDO,
 
             mux: Default::default(),
+            assume_init: false,
         }
     }
 }
@@ -403,18 +408,22 @@ pub(crate) unsafe fn init(config: Config) {
     }
 
     // Turn on the HSI
-    match config.hsi {
-        None => RCC.cr().modify(|w| w.set_hsion(true)),
-        Some(hsidiv) => RCC.cr().modify(|w| {
-            w.set_hsidiv(hsidiv);
-            w.set_hsion(true);
-        }),
+    if !config.assume_init {
+        match config.hsi {
+            None => RCC.cr().modify(|w| w.set_hsion(true)),
+            Some(hsidiv) => RCC.cr().modify(|w| {
+                w.set_hsidiv(hsidiv);
+                w.set_hsion(true);
+            }),
+        }
+        while !RCC.cr().read().hsirdy() {}
     }
-    while !RCC.cr().read().hsirdy() {}
 
     // Use the HSI clock as system clock during the actual clock setup
-    RCC.cfgr().modify(|w| w.set_sw(Sysclk::HSI));
-    while RCC.cfgr().read().sws() != Sysclk::HSI {}
+    if !config.assume_init {
+        RCC.cfgr().modify(|w| w.set_sw(Sysclk::HSI));
+        while RCC.cfgr().read().sws() != Sysclk::HSI {}
+    }
 
     // Configure HSI
     let hsi = match config.hsi {
@@ -425,29 +434,36 @@ pub(crate) unsafe fn init(config: Config) {
     // Configure HSE
     let hse = match config.hse {
         None => {
-            RCC.cr().modify(|w| w.set_hseon(false));
+            if !config.assume_init {
+                RCC.cr().modify(|w| w.set_hseon(false));
+            }
             None
         }
         Some(hse) => {
-            RCC.cr().modify(|w| {
-                w.set_hsebyp(hse.mode != HseMode::Oscillator);
-                #[cfg(any(rcc_h5, rcc_h50, rcc_h7rs))]
-                w.set_hseext(match hse.mode {
-                    HseMode::Oscillator | HseMode::Bypass => pac::rcc::vals::Hseext::ANALOG,
-                    HseMode::BypassDigital => pac::rcc::vals::Hseext::DIGITAL,
+            if !config.assume_init {
+                RCC.cr().modify(|w| {
+                    w.set_hsebyp(hse.mode != HseMode::Oscillator);
+                    #[cfg(any(rcc_h5, rcc_h50, rcc_h7rs))]
+                    w.set_hseext(match hse.mode {
+                        HseMode::Oscillator | HseMode::Bypass => pac::rcc::vals::Hseext::ANALOG,
+                        HseMode::BypassDigital => pac::rcc::vals::Hseext::DIGITAL,
+                    });
                 });
-            });
-            RCC.cr().modify(|w| w.set_hseon(true));
-            while !RCC.cr().read().hserdy() {}
+                RCC.cr().modify(|w| w.set_hseon(true));
+                while !RCC.cr().read().hserdy() {}
+            }
             Some(hse.freq)
         }
     };
 
     // Configure HSI48.
-    let hsi48 = config.hsi48.map(super::init_hsi48);
+    let hsi48 = config.hsi48.map(|hsi| super::init_hsi48(hsi, config.assume_init));
 
     // Configure CSI.
-    RCC.cr().modify(|w| w.set_csion(config.csi));
+    if !config.assume_init {
+        RCC.cr().modify(|w| w.set_csion(config.csi));
+    }
+
     let csi = match config.csi {
         false => None,
         true => {
@@ -467,10 +483,10 @@ pub(crate) unsafe fn init(config: Config) {
 
     // Configure PLLs.
     let pll_input = PllInput { csi, hse, hsi };
-    let pll1 = init_pll(0, config.pll1, &pll_input);
-    let pll2 = init_pll(1, config.pll2, &pll_input);
+    let pll1 = init_pll(0, config.pll1, &pll_input, config.assume_init);
+    let pll2 = init_pll(1, config.pll2, &pll_input, config.assume_init);
     #[cfg(any(rcc_h5, stm32h7, stm32h7rs))]
-    let pll3 = init_pll(2, config.pll3, &pll_input);
+    let pll3 = init_pll(2, config.pll3, &pll_input, config.assume_init);
 
     // Configure sysclk
     let sys = match config.sys {
@@ -552,12 +568,12 @@ pub(crate) unsafe fn init(config: Config) {
     #[cfg(stm32h7rs)]
     assert!(apb5 <= pclk_max);
 
-    flash_setup(hclk, config.voltage_scale);
+    flash_setup(hclk, config.voltage_scale, config.assume_init);
 
     let rtc = config.ls.init();
 
     #[cfg(stm32h7)]
-    {
+    if !config.assume_init {
         RCC.d1cfgr().modify(|w| {
             w.set_d1cpre(config.d1c_pre);
             w.set_d1ppre(config.apb3_pre);
@@ -575,7 +591,7 @@ pub(crate) unsafe fn init(config: Config) {
         });
     }
     #[cfg(stm32h7rs)]
-    {
+    if !config.assume_init {
         RCC.cdcfgr().write(|w| {
             w.set_cpre(config.d1c_pre);
         });
@@ -594,7 +610,7 @@ pub(crate) unsafe fn init(config: Config) {
         });
     }
     #[cfg(stm32h5)]
-    {
+    if !config.assume_init {
         // Set hpre
         RCC.cfgr2().modify(|w| w.set_hpre(config.ahb_pre));
         while RCC.cfgr2().read().hpre() != config.ahb_pre {}
@@ -607,13 +623,15 @@ pub(crate) unsafe fn init(config: Config) {
         });
     }
 
-    RCC.cfgr().modify(|w| w.set_timpre(config.timer_prescaler.into()));
+    if !config.assume_init {
+        RCC.cfgr().modify(|w| w.set_timpre(config.timer_prescaler.into()));
 
-    RCC.cfgr().modify(|w| w.set_sw(config.sys));
-    while RCC.cfgr().read().sws() != config.sys {}
+        RCC.cfgr().modify(|w| w.set_sw(config.sys));
+        while RCC.cfgr().read().sws() != config.sys {}
+    }
 
     // Disable HSI if not used
-    if config.hsi.is_none() {
+    if !config.assume_init && config.hsi.is_none() {
         RCC.cr().modify(|w| w.set_hsion(false));
     }
 
@@ -632,7 +650,9 @@ pub(crate) unsafe fn init(config: Config) {
         while !pac::SYSCFG.cccsr().read().rdy() {}
     }
 
-    config.mux.init();
+    if !config.assume_init {
+        config.mux.init();
+    }
 
     set_clocks!(
         sys: Some(sys),
@@ -715,17 +735,19 @@ struct PllOutput {
     r: Option<Hertz>,
 }
 
-fn init_pll(num: usize, config: Option<Pll>, input: &PllInput) -> PllOutput {
+fn init_pll(num: usize, config: Option<Pll>, input: &PllInput, assume_init: bool) -> PllOutput {
     let Some(config) = config else {
         // Stop PLL
-        RCC.cr().modify(|w| w.set_pllon(num, false));
-        while RCC.cr().read().pllrdy(num) {}
+         if !assume_init {
+            RCC.cr().modify(|w| w.set_pllon(num, false));
+            while RCC.cr().read().pllrdy(num) {}
 
-        // "To save power when PLL1 is not used, the value of PLL1M must be set to 0.""
-        #[cfg(any(stm32h7, stm32h7rs))]
-        RCC.pllckselr().write(|w| w.set_divm(num, PllPreDiv::from_bits(0)));
-        #[cfg(stm32h5)]
-        RCC.pllcfgr(num).write(|w| w.set_divm(PllPreDiv::from_bits(0)));
+            // "To save power when PLL1 is not used, the value of PLL1M must be set to 0.""
+            #[cfg(any(stm32h7, stm32h7rs))]
+            RCC.pllckselr().write(|w| w.set_divm(num, PllPreDiv::from_bits(0)));
+            #[cfg(stm32h5)]
+            RCC.pllcfgr(num).write(|w| w.set_divm(PllPreDiv::from_bits(0)));
+         }
 
         return PllOutput {
             p: None,
@@ -768,7 +790,7 @@ fn init_pll(num: usize, config: Option<Pll>, input: &PllInput) -> PllOutput {
         if num == 0 {
             // on PLL1, DIVP must be even for most series.
             // The enum value is 1 less than the divider, so check it's odd.
-            #[cfg(not(pwr_h7rm0468))]
+            #[cfg(all(not(pwr_h7rm0468), not(stm32h7rs)))]
             assert!(div.to_bits() % 2 == 1);
             #[cfg(pwr_h7rm0468)]
             assert!(div.to_bits() % 2 == 1 || div.to_bits() == 0);
@@ -780,19 +802,21 @@ fn init_pll(num: usize, config: Option<Pll>, input: &PllInput) -> PllOutput {
     let r = config.divr.map(|div| vco_clk / div);
 
     #[cfg(stm32h5)]
-    RCC.pllcfgr(num).write(|w| {
-        w.set_pllsrc(config.source);
-        w.set_divm(config.prediv);
-        w.set_pllvcosel(vco_range);
-        w.set_pllrge(ref_range);
-        w.set_pllfracen(false);
-        w.set_pllpen(p.is_some());
-        w.set_pllqen(q.is_some());
-        w.set_pllren(r.is_some());
-    });
+    if !assume_init {
+        RCC.pllcfgr(num).write(|w| {
+            w.set_pllsrc(config.source);
+            w.set_divm(config.prediv);
+            w.set_pllvcosel(vco_range);
+            w.set_pllrge(ref_range);
+            w.set_pllfracen(false);
+            w.set_pllpen(p.is_some());
+            w.set_pllqen(q.is_some());
+            w.set_pllren(r.is_some());
+        });
+    }
 
     #[cfg(any(stm32h7, stm32h7rs))]
-    {
+    if !assume_init {
         RCC.pllckselr().modify(|w| {
             w.set_divm(num, config.prediv);
             w.set_pllsrc(config.source);
@@ -807,20 +831,22 @@ fn init_pll(num: usize, config: Option<Pll>, input: &PllInput) -> PllOutput {
         });
     }
 
-    RCC.plldivr(num).write(|w| {
-        w.set_plln(config.mul);
-        w.set_pllp(config.divp.unwrap_or(PllDiv::DIV2));
-        w.set_pllq(config.divq.unwrap_or(PllDiv::DIV2));
-        w.set_pllr(config.divr.unwrap_or(PllDiv::DIV2));
-    });
+        if !assume_init {
+        RCC.plldivr(num).write(|w| {
+            w.set_plln(config.mul);
+            w.set_pllp(config.divp.unwrap_or(PllDiv::DIV2));
+            w.set_pllq(config.divq.unwrap_or(PllDiv::DIV2));
+            w.set_pllr(config.divr.unwrap_or(PllDiv::DIV2));
+        });
 
-    RCC.cr().modify(|w| w.set_pllon(num, true));
-    while !RCC.cr().read().pllrdy(num) {}
+        RCC.cr().modify(|w| w.set_pllon(num, true));
+        while !RCC.cr().read().pllrdy(num) {}
+    }
 
     PllOutput { p, q, r }
 }
 
-fn flash_setup(clk: Hertz, vos: VoltageScale) {
+fn flash_setup(clk: Hertz, vos: VoltageScale, assume_init: bool) {
     // RM0481 Rev 1, table 37
     // LATENCY  WRHIGHFREQ  VOS3           VOS2            VOS1            VOS0
     //      0           0   0 to 20 MHz    0 to 30 MHz     0 to 34 MHz     0 to 42 MHz
@@ -968,9 +994,11 @@ fn flash_setup(clk: Hertz, vos: VoltageScale) {
 
     debug!("flash: latency={} wrhighfreq={}", latency, wrhighfreq);
 
-    FLASH.acr().write(|w| {
-        w.set_wrhighfreq(wrhighfreq);
-        w.set_latency(latency);
-    });
-    while FLASH.acr().read().latency() != latency {}
+    if !assume_init {
+        FLASH.acr().write(|w| {
+            w.set_wrhighfreq(wrhighfreq);
+            w.set_latency(latency);
+        });
+        while FLASH.acr().read().latency() != latency {}
+    }
 }

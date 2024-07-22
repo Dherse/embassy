@@ -24,13 +24,15 @@ impl Default for Hsi48Config {
     }
 }
 
-pub(crate) fn init_hsi48(config: Hsi48Config) -> Hertz {
+pub(crate) fn init_hsi48(config: Hsi48Config, assume_init: bool) -> Hertz {
     // Enable VREFINT reference for HSI48 oscillator
     #[cfg(stm32l0)]
-    crate::pac::SYSCFG.cfgr3().modify(|w| {
-        w.set_enref_hsi48(true);
-        w.set_en_vrefint(true);
-    });
+    if !assume_init {
+        crate::pac::SYSCFG.cfgr3().modify(|w| {
+            w.set_enref_hsi48(true);
+            w.set_en_vrefint(true);
+        });
+    }
 
     // Enable HSI48
     #[cfg(not(any(stm32u5, stm32g0, stm32h5, stm32h7, stm32h7rs, stm32u5, stm32wba, stm32f0)))]
@@ -40,10 +42,12 @@ pub(crate) fn init_hsi48(config: Hsi48Config) -> Hertz {
     #[cfg(any(stm32f0))]
     let r = RCC.cr2();
 
-    r.modify(|w| w.set_hsi48on(true));
-    while r.read().hsi48rdy() == false {}
+    if !assume_init {
+        r.modify(|w| w.set_hsi48on(true));
+        while r.read().hsi48rdy() == false {}
+    }
 
-    if config.sync_from_usb {
+    if !assume_init && config.sync_from_usb {
         rcc::enable_and_reset::<crate::peripherals::CRS>();
 
         CRS.cfgr().modify(|w| {

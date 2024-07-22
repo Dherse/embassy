@@ -135,6 +135,52 @@ impl RccInfo {
     }
 
     // TODO: should this be `unsafe`?
+    pub(crate) fn enable_with_cs(&self, _cs: CriticalSection) {
+        if self.refcount_idx_or_0xff != 0xff {
+            let refcount_idx = self.refcount_idx_or_0xff as usize;
+
+            // Use .get_mut instead of []-operator so that we control how bounds checks happen.
+            // Otherwise, core::fmt will be pulled in here in order to format the integer in the
+            // out-of-bounds error.
+            if let Some(refcount) = unsafe { crate::_generated::REFCOUNTS.get_mut(refcount_idx) } {
+                *refcount += 1;
+                if *refcount > 1 {
+                    return;
+                }
+            } else {
+                panic!("refcount_idx out of bounds: {}", refcount_idx)
+            }
+        }
+
+        #[cfg(feature = "low-power")]
+        match self.stop_mode {
+            StopMode::Standby => {}
+            StopMode::Stop2 => unsafe {
+                REFCOUNT_STOP2 += 1;
+            },
+            StopMode::Stop1 => unsafe {
+                REFCOUNT_STOP1 += 1;
+            },
+        }
+        // set the xxxEN bit
+        let enable_ptr = self.enable_ptr();
+        unsafe {
+            let val = enable_ptr.read_volatile();
+            enable_ptr.write_volatile(val | 1u32 << self.enable_bit);
+        }
+
+        // we must wait two peripheral clock cycles before the clock is active
+        // this seems to work, but might be incorrect
+        // see http://efton.sk/STM32/gotcha/g183.html
+
+        // dummy read (like in the ST HALs)
+        let _ = unsafe { enable_ptr.read_volatile() };
+
+        // DSB for good measure
+        cortex_m::asm::dsb();
+    }
+
+    // TODO: should this be `unsafe`?
     pub(crate) fn enable_and_reset_with_cs(&self, _cs: CriticalSection) {
         if self.refcount_idx_or_0xff != 0xff {
             let refcount_idx = self.refcount_idx_or_0xff as usize;
@@ -305,6 +351,17 @@ pub fn frequency<T: RccPeripheral>() -> Hertz {
 // TODO: should this be `unsafe`?
 pub fn enable_and_reset_with_cs<T: RccPeripheral>(cs: CriticalSection) {
     T::RCC_INFO.enable_and_reset_with_cs(cs);
+}
+
+
+/// Enables peripheral `T`.
+///
+/// # Safety
+///
+/// Peripheral must not be in use.
+// TODO: should this be `unsafe`?
+pub fn enable_with_cs<T: RccPeripheral>(cs: CriticalSection) {
+    T::RCC_INFO.enable_with_cs(cs);
 }
 
 /// Disables peripheral `T`.
